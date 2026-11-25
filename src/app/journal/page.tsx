@@ -19,6 +19,10 @@ type LogRow = {
   room_count: number;
   entered_by: string | null;
 };
+type MovementRow = {
+  linen_type_id: string;
+  quantity: number;
+};
 
 const SERVICE_TYPES = ["Départ", "Recouche"];
 
@@ -34,6 +38,7 @@ export default function JournalPage() {
   const [linenTypes, setLinenTypes] = useState<LinenType[]>([]);
   const [nomenclature, setNomenclature] = useState<NomenclatureRow[]>([]);
   const [logs, setLogs] = useState<LogRow[]>([]);
+  const [movements, setMovements] = useState<MovementRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -50,6 +55,7 @@ export default function JournalPage() {
   const [enteredBy, setEnteredBy] = useState("");
 
   const loadAll = useCallback(async () => {
+    if (!logDate) return;
     setLoading(true);
     setError(null);
 
@@ -65,7 +71,7 @@ export default function JournalPage() {
     const hId = hotels[0].id as string;
     setHotelId(hId);
 
-    const [{ data: rts }, { data: lts }, { data: noms }, { data: dayLogs }] =
+    const [{ data: rts }, { data: lts }, { data: noms }, { data: dayLogs }, { data: moves }] =
       await Promise.all([
         supabase.from("room_types").select("id, name").eq("hotel_id", hId).order("name"),
         supabase.from("linen_types").select("id, name").eq("hotel_id", hId).order("name"),
@@ -79,12 +85,19 @@ export default function JournalPage() {
           .eq("hotel_id", hId)
           .eq("log_date", logDate)
           .order("id", { ascending: false }),
+        supabase
+          .from("stock_movements")
+          .select("linen_type_id, quantity")
+          .eq("hotel_id", hId)
+          .eq("movement_type", "consommation")
+          .eq("movement_date", logDate),
       ]);
 
     setRoomTypes(rts ?? []);
     setLinenTypes(lts ?? []);
     setNomenclature(noms ?? []);
     setLogs(dayLogs ?? []);
+    setMovements(moves ?? []);
     if ((rts?.length ?? 0) > 0 && !roomTypeId) setRoomTypeId(rts![0].id);
     setLoading(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -100,35 +113,63 @@ export default function JournalPage() {
     setSaving(true);
     setError(null);
 
-    const { error: insertErr } = await supabase.from("daily_log").insert({
-      hotel_id: hotelId,
-      log_date: logDate,
-      room_type_id: roomTypeId,
-      service_type: serviceType,
-      room_count: roomCount,
-      entered_by: enteredBy || null,
-    });
+    const { data: insertedLog, error: insertErr } = await supabase
+      .from("daily_log")
+      .insert({
+        hotel_id: hotelId,
+        log_date: logDate,
+        room_type_id: roomTypeId,
+        service_type: serviceType,
+        room_count: roomCount,
+        entered_by: enteredBy || null,
+      })
+      .select()
+      .single();
 
-    setSaving(false);
-    if (insertErr) {
-      setError("Erreur à l'enregistrement : " + insertErr.message);
+    if (insertErr || !insertedLog) {
+      setSaving(false);
+      setError("Erreur à l'enregistrement : " + insertErr?.message);
       return;
     }
+
+    // On fige la consommation calculée à cet instant précis (nomenclature actuelle),
+    // sous forme de lignes dans le journal de mouvements de stock. Une fois écrites,
+    // ces lignes ne changeront plus jamais, même si la nomenclature change plus tard.
+    const matches = nomenclature.filter(
+      (n) => n.room_type_id === roomTypeId && n.service_type === serviceType
+    );
+    const movementRows = matches
+      .filter((m) => m.quantity_needed * roomCount > 0)
+      .map((m) => ({
+        hotel_id: hotelId,
+        linen_type_id: m.linen_type_id,
+        movement_type: "consommation",
+        quantity: -(m.quantity_needed * roomCount),
+        movement_date: logDate,
+        daily_log_id: insertedLog.id,
+      }));
+
+    if (movementRows.length > 0) {
+      const { error: moveErr } = await supabase.from("stock_movements").insert(movementRows);
+      if (moveErr) {
+        setSaving(false);
+        setError(
+          "L'entrée est enregistrée, mais le mouvement de stock a échoué : " + moveErr.message
+        );
+        return;
+      }
+    }
+
+    setSaving(false);
     setRoomCount(1);
     await loadAll();
   }
 
-  // Calcul du linge consommé, à partir des lignes du jour + nomenclature
+  // Linge consommé affiché = somme des mouvements déjà figés pour ce jour (jamais recalculé depuis la nomenclature actuelle)
   const consumption: Record<string, number> = {};
   for (const lt of linenTypes) consumption[lt.id] = 0;
-  for (const log of logs) {
-    const matches = nomenclature.filter(
-      (n) => n.room_type_id === log.room_type_id && n.service_type === log.service_type
-    );
-    for (const m of matches) {
-      consumption[m.linen_type_id] =
-        (consumption[m.linen_type_id] ?? 0) + m.quantity_needed * log.room_count;
-    }
+  for (const m of movements) {
+    consumption[m.linen_type_id] = (consumption[m.linen_type_id] ?? 0) + Math.abs(m.quantity);
   }
 
   const roomTypeName = (id: string) => roomTypes.find((r) => r.id === id)?.name ?? "?";
@@ -254,7 +295,7 @@ export default function JournalPage() {
       </section>
 
       <section>
-        <h2 className="text-lg font-semibold mb-3">Linge consommé ce jour (calcul automatique)</h2>
+        <h2 className="text-lg font-semibold mb-3">Linge consommé ce jour (figé à la saisie)</h2>
         <div className="overflow-x-auto rounded-xl border border-gray-200">
           <table className="w-full text-sm">
             <thead className="bg-gray-50">
